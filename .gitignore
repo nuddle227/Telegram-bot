@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.env
+token.txt
+# the database and backups are created locally (see README); real data must never be committed
+queue.sqlite
+backup/
+*.sqlite-journal
+.venv/
+venv/
+*.sqlite-wal
+*.sqlite-shm
+*.db
+.DS_Store

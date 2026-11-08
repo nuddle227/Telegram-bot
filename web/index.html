@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Digital Queue for the Dean's Office</title>
+<style>
+:root{--bg:#f6f8fc;--text:#15233b;--card:#fff;--accent:#1a4d8f;--muted:#44546e}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1726;--text:#eaf0fb;--card:#18233a;--accent:#9bc3f6;--muted:#b6c4dc}}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text);line-height:1.5}
+header,main,footer{max-width:900px;margin:0 auto;padding:16px}
+.brand{display:flex;align-items:center;gap:12px}.brand img{width:48px;height:48px}
+h1{font-size:1.5rem;margin:0}h2{font-size:1.2rem;color:var(--accent)}
+.card{background:var(--card);border-radius:14px;padding:16px;margin:16px 0}
+img{max-width:100%;height:auto;border-radius:10px;display:block}
+.grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+.bell{width:96px;margin-top:8px}figcaption{color:var(--muted);font-size:.9rem;margin-top:6px}
+a{color:var(--accent)}
+</style>
+</head>
+<body>
+<header><div class="brand"><img src="img/bot_logo.svg" width="48" height="48" alt="Digital Queue logo: two people icons"><h1>Digital Queue for the Dean's Office</h1></div></header>
+<main>
+  <section class="card">
+    <figure style="margin:0"><picture>
+        <source type="image/webp" srcset="img/team-640.webp">
+        <img src="img/team-640.jpg" width="640" height="480" alt="Five smiling students waving in front of the university building">
+      </picture><figcaption>Take a ticket in Telegram and skip the line.</figcaption></figure>
+  </section>
+  <h2>How it works</h2>
+  <div class="grid">
+    <section class="card"><h3>1. Register once</h3><picture>
+        <source type="image/webp" srcset="img/study-640.webp">
+        <img src="img/study-640.jpg" width="640" height="480" alt="Group of students studying together around a laptop">
+      </picture><p>Send your name and group to the bot. Only the queue uses this data.</p></section>
+    <section class="card"><h3>2. Take a ticket</h3><picture>
+        <source type="image/webp" srcset="img/queue-640.webp">
+        <img src="img/queue-640.jpg" width="640" height="357" alt="Students waiting in line at the dean's office window">
+      </picture><p>Choose a service and see your position in the queue.</p></section>
+    <section class="card"><h3>3. Get a notification</h3><picture>
+        <source type="image/webp" srcset="img/notify-640.webp">
+        <img src="img/notify-640.jpg" width="640" height="427" alt="Student looking at a phone with a notification bubble">
+      </picture><p>The bot writes to you when it is your turn.</p><img class="bell" src="img/bell.gif" alt=""></section>
+  </div>
+</main>
+<footer><p>Astana IT University, SE-2619. Open the bot in Telegram: <a href="https://t.me/">t.me/your_bot_name</a></p></footer>
+</body>
+</html>
