@@ -2,10 +2,9 @@
 The same functions will be called from the Telegram bot in Stage 2.
 Usage examples are in README.txt. All SQL uses ? placeholders (no string concatenation)."""
 import argparse, hashlib, hmac, os, sqlite3, sys
-from pathlib import Path
 from datetime import datetime, date
 
-DB_PATH = os.environ.get("DB_PATH", str(Path(__file__).resolve().parent / "queue.sqlite"))
+DB_PATH = os.environ.get("DB_PATH", "queue.sqlite")
 
 QDATE = None   # the queue date the program works with
 
@@ -26,8 +25,8 @@ def active_date(db):
 def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def hash_pin(pin, salt_hex, rounds=200_000):
-    return hashlib.pbkdf2_hmac("sha256", pin.encode(), bytes.fromhex(salt_hex), rounds).hex()
+def hash_pin(pin, salt_hex):
+    return hashlib.pbkdf2_hmac("sha256", pin.encode(), bytes.fromhex(salt_hex), 200_000).hex()
 
 def log(db, staff_id, ticket_id, action):
     db.execute("INSERT INTO audit_log(staff_id, ticket_id, action, created_at) VALUES (?,?,?,?)",
@@ -36,11 +35,9 @@ def log(db, staff_id, ticket_id, action):
 
 def check_staff(db, tg_id, pin):
     """R12: only approved staff with the right PIN can use staff functions."""
-    columns = {r[1] for r in db.execute("PRAGMA table_info(staff)")}
-    rounds_field = "pin_rounds" if "pin_rounds" in columns else "200000 AS pin_rounds"
-    row = db.execute(f"SELECT staff_id, role, pin_salt, pin_hash, {rounds_field} FROM staff "
+    row = db.execute("SELECT staff_id, role, pin_salt, pin_hash FROM staff "
                      "WHERE telegram_id = ? AND is_active = 1", (tg_id,)).fetchone()
-    if row is None or not hmac.compare_digest(hash_pin(pin, row["pin_salt"], row["pin_rounds"]), row["pin_hash"]):
+    if row is None or not hmac.compare_digest(hash_pin(pin, row["pin_salt"]), row["pin_hash"]):
         log(db, row["staff_id"] if row else None, None, "denied")
         sys.exit("Access denied: staff functions are only for approved staff.")
     return row
@@ -91,10 +88,8 @@ def take(db, tg, prefix):                                # WRITE
         db.execute("""INSERT INTO tickets(student_id, service_id, queue_date, number, status, created_at)
                       VALUES (?,?,?,?, 'waiting', ?)""", (st["student_id"], srv["service_id"], today(), n, now()))
         db.commit()
-    except sqlite3.IntegrityError as e:
-        if "DAILY_LIMIT" in str(e):
-            sys.exit("Daily ticket limit reached (3 tickets, including cancelled).")
-        sys.exit("You already have an active ticket, or the ticket number is taken (R8).")
+    except sqlite3.IntegrityError:
+        sys.exit("You already have an active ticket. Cancel it first (R8).")
     print("Ticket created.")
     show_my(db, tg)
 
@@ -137,9 +132,6 @@ def can_serve(db, staff, srv):
 
 def show_queue(db, staff, prefix):                       # READ
     srv = service_by_prefix(db, prefix)
-    if not can_serve(db, staff, srv):
-        log(db, staff["staff_id"], None, "denied")
-        sys.exit("Access denied: you do not work with this service.")
     rows = db.execute("""SELECT t.number, t.status, st.full_name, st.group_name FROM tickets t
                          LEFT JOIN students st ON st.student_id = t.student_id
                          WHERE t.service_id = ? AND t.queue_date = ? AND t.status IN ('waiting','called')
@@ -147,7 +139,7 @@ def show_queue(db, staff, prefix):                       # READ
     print(f"Staff panel: {srv['name']} ({srv['prefix']}), in queue: {len(rows)}")
     for r in rows:
         mark = "NOW SERVING" if r["status"] == "called" else "waiting"
-        print(f"  {srv['prefix']}-{r['number']:<3} {(r['full_name'] or '—'):<24} {(r['group_name'] or '—'):<8} {mark}")
+        print(f"  {srv['prefix']}-{r['number']:<3} {r['full_name']:<24} {r['group_name']:<8} {mark}")
 
 def staff_action(db, staff, prefix, action):             # WRITE
     srv = service_by_prefix(db, prefix)

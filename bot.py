@@ -11,14 +11,18 @@ import asyncio
 import hashlib
 import hmac
 import html
+import json
 import logging
 import math
 import os
+import re
 import sqlite3
+import threading
 import time
 from collections import deque
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message, Update
@@ -49,7 +53,14 @@ WORKDAYS = (0, 1, 2, 3, 4)   # Monday = 0 ... Friday = 4
 CALL_TIMEOUT_MIN = 5   # called student did not come after this time: the operator gets a hint
 MAX_SWAPS = 1          # how many times a student may let the next person go first
 CLOSE_STALE = True     # in a new day, close tickets left over from earlier days
-CORRIDOR_FRESH_SEC = 120   # a people-counter reading older than this is not shown
+CORRIDOR_FRESH_SEC = 120   # a people-counter reading older than this is not shown (the sensor counts as "offline")
+CORRIDOR_LOW = 5           # up to this many people in the corridor = "free"  (rule A: "tell me when it is free")
+CORRIDOR_HIGH = 12         # this many people or more = "crowded"            (rule B: alert to the staff)
+CORRIDOR_ALERT_READINGS = 3        # "crowded" must last for this many readings in a row (avoids false alarms)
+CORRIDOR_ALERT_COOLDOWN_MIN = 10   # the staff get at most one crowd alert per this many minutes
+SENSOR_KEEP_DAYS = 30      # sensor readings older than this are deleted automatically (privacy: data minimisation)
+SENSOR_GATEWAY_PORT = 8765 # the sensor sends its numbers to http://127.0.0.1:<port>  (0 = gateway off)
+SENSOR_API_KEY = os.environ.get("SENSOR_API_KEY", "demo-sensor-key")   # the "password" of the sensor; change it for real use
 # =====================================================================
 
 BASE = Path(__file__).resolve().parent
@@ -116,11 +127,42 @@ TEXTS = {
   "later_no": "Пропустить вперёд нельзя: за вами никого нет или вы уже использовали эту возможность.",
   "timeout_hint": "⏰ {code} вызван {min} мин назад и не подошёл. Нажмите «Пропустить» в панели услуги.",
   "stats_extra": "\n\nПо часам (за всё время):\n{hours}\n\nСреднее ожидание, мин:\n{wait}\n\nПотеряно (пропущено или отменено): {lost}",
-  "corridor": "👥 В коридоре сейчас: {n}",
+  "corridor": "👥 В коридоре сейчас: <b>{n}</b> — {lvl}",
+  "lvl_low": "🟢 свободно", "lvl_mid": "🟡 умеренно", "lvl_high": "🔴 многолюдно",
+  "trend_up": "↗ людей становится больше", "trend_down": "↘ людей становится меньше", "trend_flat": "→ без заметных изменений",
+  "b_corridor": "🚪 Коридор", "b_sub_on": "🔔 Сообщить, когда будет свободно", "b_sub_off": "🔕 Не сообщать",
+  "b_sensor": "ℹ️ Про датчик", "b_smart": "📡 Умный коридор",
+  "cor_title": "🚪 <b>Коридор у деканата</b>",
+  "cor_none": "📡 Сейчас датчик не передаёт данные, поэтому число людей неизвестно. Попробуйте позже.",
+  "tip_low": "💡 Сейчас свободно — хорошее время подойти.",
+  "tip_mid": "💡 Людей немного. Если ваша очередь не скоро, можно подойти чуть позже.",
+  "tip_high": "💡 Людей много. Если ваша очередь не скоро, подождите вне коридора: бот напишет, когда станет свободнее и когда подойдёт ваш черёд.",
+  "sub_state_on": "🔔 Уведомление включено: бот напишет, когда в коридоре станет не больше {low} чел.",
+  "sub_on": "✅ Готово! Я напишу, когда в коридоре станет не больше {low} чел.",
+  "sub_off": "🔕 Хорошо, уведомление выключено.",
+  "sub_need_ticket": "⚠️ Уведомление можно включить, только когда у вас есть талон в ожидании.",
+  "sub_already_free": "ℹ️ Сейчас в коридоре и так свободно ({n} чел.) — можно идти.",
+  "cor_free_push": "🟢 <b>В коридоре стало свободно</b>\nСейчас там {n} чел. Ваш талон {code}, перед вами: {ahead}. Хорошее время подойти.",
+  "cor_alert": "⚠️ <b>В коридоре много людей: {n}</b> (порог {hi}).\nМожно вызывать следующих быстрее или подключить ещё одного оператора.",
+  "sensor_lost": "📡 <b>Датчик коридора не отвечает</b> уже {min} мин. Проверьте питание датчика и сеть.",
+  "sensor_back": "📡 Датчик коридора снова на связи.",
+  "sensor_info": "ℹ️ <b>Как работает датчик</b>\n\nДатчик стоит у двери коридора и только считает, сколько человек вошло и вышло. В нём нет камеры: лиц, имён и Telegram ID он не видит и не хранит.\n\nВ базе остаются только время и числа. Записи старше {days} дн. удаляются сами. Уведомление «когда будет свободно» никому не передаёт ваши данные.",
+  "smart_title": "📡 <b>Умный коридор (датчик)</b>",
+  "sm_online": "Датчик: 🟢 на связи (последний замер {sec} с назад)",
+  "sm_offline": "Датчик: 🔴 нет данных уже {min} мин",
+  "sm_none": "Датчик: ⚪ данных ещё не было",
+  "sm_now": "Сейчас в коридоре: <b>{n}</b> чел. — {lvl}",
+  "sm_today": "Сегодня: пик {peak} чел. (в {at}), среднее {avg}, замеров {k}",
+  "sm_no_today": "Сегодня замеров ещё нет.",
+  "sm_subs": "Ждут уведомления «стало свободно»: {n}",
+  "sm_limits": "Пороги: свободно — не больше {low}, многолюдно — от {hi}",
+  "sm_hours": "По часам сегодня (среднее число людей):",
+  "sm_recent": "Последние замеры:",
+  "sm_recent_row": "  {time} — вошло {i}, вышло {o}, в коридоре {n}",
   "cancel_confirm": "Отменить талон <b>{code}</b>?",
   "cancelled": "✅ Талон отменён.",
   "cant_cancel": "Отменить нечего: талона нет или вас уже вызвали.",
-  "help": "ℹ️ <b>Как пользоваться ботом</b>\n\n1. Нажмите «Взять талон» и выберите услугу.\n2. Следите за позицией в разделе «Мой талон».\n3. Когда подойдёт очередь, бот пришлёт уведомление 🔔 — заходите в деканат.\n4. Передумали? Нажмите «Отменить талон».\n\nВ день можно взять не более {n} талонов. Часы работы: {hours}.\nВсе уведомления дублируются текстом, звук не обязателен.",
+  "help": "ℹ️ <b>Как пользоваться ботом</b>\n\n1. Нажмите «Взять талон» и выберите услугу.\n2. Следите за позицией в разделе «Мой талон».\n3. Когда подойдёт очередь, бот пришлёт уведомление 🔔 — заходите в деканат.\n4. Передумали? Нажмите «Отменить талон».\n5. Кнопка «Коридор» показывает, сколько людей сейчас у деканата. Если у вас есть талон, можно включить уведомление «когда станет свободно».\n\nВ день можно взять не более {n} талонов. Часы работы: {hours}.\nВсе уведомления дублируются текстом, звук не обязателен.",
   "denied": "⛔ Доступ запрещён: функции сотрудников только для одобренных сотрудников.",
   "ask_pin": "🔐 Введите ваш <b>PIN</b> сотрудника. Сообщение с PIN бот сразу удалит.",
   "pin_wrong": "❌ Неверный PIN. Осталось попыток: {left}.",
@@ -189,11 +231,42 @@ TEXTS = {
   "later_no": "You cannot let someone go first: nobody is behind you, or you already used this option.",
   "timeout_hint": "⏰ {code} was called {min} min ago and has not come. Press \"Skip\" in the service panel.",
   "stats_extra": "\n\nBy hour (all time):\n{hours}\n\nAverage wait, min:\n{wait}\n\nLost (skipped or cancelled): {lost}",
-  "corridor": "👥 People in the corridor now: {n}",
+  "corridor": "👥 People in the corridor now: <b>{n}</b> — {lvl}",
+  "lvl_low": "🟢 free", "lvl_mid": "🟡 moderate", "lvl_high": "🔴 crowded",
+  "trend_up": "↗ getting busier", "trend_down": "↘ getting quieter", "trend_flat": "→ no big change",
+  "b_corridor": "🚪 Corridor", "b_sub_on": "🔔 Tell me when it is free", "b_sub_off": "🔕 Do not notify",
+  "b_sensor": "ℹ️ About the sensor", "b_smart": "📡 Smart corridor",
+  "cor_title": "🚪 <b>Corridor near the dean's office</b>",
+  "cor_none": "📡 The sensor is not sending data now, so the number of people is unknown. Please try later.",
+  "tip_low": "💡 It is free now - a good time to come.",
+  "tip_mid": "💡 Not many people. If your turn is not soon, you can come a little later.",
+  "tip_high": "💡 Many people. If your turn is not soon, wait outside the corridor: the bot will write when it gets freer and when your turn comes.",
+  "sub_state_on": "🔔 Notification is on: the bot will write when there are no more than {low} people in the corridor.",
+  "sub_on": "✅ Done! I will write when there are no more than {low} people in the corridor.",
+  "sub_off": "🔕 OK, the notification is off.",
+  "sub_need_ticket": "⚠️ You can turn this on only while you have a waiting ticket.",
+  "sub_already_free": "ℹ️ It is already free in the corridor ({n} people) - you can go.",
+  "cor_free_push": "🟢 <b>The corridor is free now</b>\nThere are {n} people. Your ticket {code}, people ahead: {ahead}. A good time to come.",
+  "cor_alert": "⚠️ <b>Many people in the corridor: {n}</b> (limit {hi}).\nYou can call the next students faster or add one more operator.",
+  "sensor_lost": "📡 <b>The corridor sensor does not respond</b> for {min} min. Check the sensor power and the network.",
+  "sensor_back": "📡 The corridor sensor is back online.",
+  "sensor_info": "ℹ️ <b>How the sensor works</b>\n\nThe sensor stands at the corridor door and only counts how many people came in and went out. It has no camera: it does not see or store faces, names or Telegram IDs.\n\nOnly time and numbers stay in the database. Records older than {days} days are deleted automatically. The \"tell me when it is free\" notification does not share your data with anyone.",
+  "smart_title": "📡 <b>Smart corridor (sensor)</b>",
+  "sm_online": "Sensor: 🟢 online (last reading {sec} s ago)",
+  "sm_offline": "Sensor: 🔴 no data for {min} min",
+  "sm_none": "Sensor: ⚪ no data yet",
+  "sm_now": "People in the corridor now: <b>{n}</b> - {lvl}",
+  "sm_today": "Today: peak {peak} people (at {at}), average {avg}, readings {k}",
+  "sm_no_today": "No readings today yet.",
+  "sm_subs": "Waiting for the \"it is free\" notification: {n}",
+  "sm_limits": "Limits: free - up to {low}, crowded - from {hi}",
+  "sm_hours": "By hour today (average number of people):",
+  "sm_recent": "Latest readings:",
+  "sm_recent_row": "  {time} - in {i}, out {o}, in corridor {n}",
   "cancel_confirm": "Cancel ticket <b>{code}</b>?",
   "cancelled": "✅ Ticket cancelled.",
   "cant_cancel": "Nothing to cancel: no ticket, or you have already been called.",
-  "help": "ℹ️ <b>How to use the bot</b>\n\n1. Press \"Take a ticket\" and choose a service.\n2. Follow your position in \"My ticket\".\n3. When your turn comes, the bot sends a 🔔 notification - come to the office.\n4. Changed your mind? Press \"Cancel ticket\".\n\nYou can take at most {n} tickets per day. Office hours: {hours}.\nEvery notification is also written as text, so sound is not required.",
+  "help": "ℹ️ <b>How to use the bot</b>\n\n1. Press \"Take a ticket\" and choose a service.\n2. Follow your position in \"My ticket\".\n3. When your turn comes, the bot sends a 🔔 notification - come to the office.\n4. Changed your mind? Press \"Cancel ticket\".\n5. The \"Corridor\" button shows how many people are near the office now. If you have a ticket, you can turn on the \"tell me when it is free\" notification.\n\nYou can take at most {n} tickets per day. Office hours: {hours}.\nEvery notification is also written as text, so sound is not required.",
   "denied": "⛔ Access denied: staff functions are only for approved staff.",
   "ask_pin": "🔐 Enter your staff <b>PIN</b>. The bot deletes the message with the PIN at once.",
   "pin_wrong": "❌ Wrong PIN. Attempts left: {left}.",
@@ -294,6 +367,11 @@ def ensure_schema():
                       reading_id INTEGER PRIMARY KEY, sensor_id TEXT NOT NULL, recorded_at TEXT NOT NULL,
                       people_in INTEGER NOT NULL CHECK (people_in >= 0), people_out INTEGER NOT NULL CHECK (people_out >= 0),
                       in_corridor INTEGER NOT NULL CHECK (in_corridor >= 0))""")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_sensor_time ON sensor_readings(recorded_at)")
+        # rule A ("tell me when the corridor is free"): one row per subscribed student, deleted together with the student
+        db.execute("""CREATE TABLE IF NOT EXISTS corridor_subs (
+                      student_id INTEGER PRIMARY KEY REFERENCES students(student_id) ON DELETE CASCADE,
+                      created_at TEXT NOT NULL)""")
 
 
 def close_stale():
@@ -322,6 +400,254 @@ def corridor_now():
     except ValueError:
         return None
     return r["in_corridor"] if age <= CORRIDOR_FRESH_SEC else None
+
+
+# ---------------------------------------------------------------------
+#  Smart corridor (IoT, Project Stage 2 - Part D).
+#  Layers:  sensor (sensor_sim.py)  ->  network (HTTP + API key)  ->  gateway + database + rules (here)  ->  application (Telegram)
+#  The sensor only counts "entered / left". No camera, no names, no Telegram IDs are ever stored with a reading.
+# ---------------------------------------------------------------------
+TS_FMT = "%Y-%m-%d %H:%M:%S"
+SENSOR_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+MAX_STEP = 20            # one reading cannot add or remove more people than this (sanity check)
+MAX_INSIDE = 500         # more people than this cannot be in the corridor
+CORR = {"last_id": None, "high_run": 0, "last_alert": 0.0, "was_online": False, "lost_sent": False}
+GATEWAY = {"server": None}
+
+
+def corridor_level(n):
+    if n <= CORRIDOR_LOW:
+        return "low"
+    return "high" if n >= CORRIDOR_HIGH else "mid"
+
+
+def _ts(text):
+    try:
+        return datetime.strptime(text[:19], TS_FMT)
+    except (TypeError, ValueError):
+        return None
+
+
+def corridor_status():                                                  # READ
+    """state: 'none' (no data ever) / 'offline' (data too old) / 'online'. 'now' and 'level' exist only when online."""
+    with conn() as db:
+        last = db.execute("SELECT in_corridor, recorded_at FROM sensor_readings "
+                          "ORDER BY recorded_at DESC, reading_id DESC LIMIT 1").fetchone()
+        if last is None:
+            return {"state": "none", "now": None, "level": None, "age": None, "trend": None}
+        ts = _ts(last["recorded_at"])
+        age = (datetime.now() - ts).total_seconds() if ts else None
+        if age is None or age > CORRIDOR_FRESH_SEC:
+            return {"state": "offline", "now": None, "level": None, "age": age, "trend": None}
+        lo = (datetime.now() - timedelta(minutes=12)).strftime(TS_FMT)
+        hi = (datetime.now() - timedelta(minutes=8)).strftime(TS_FMT)
+        ref = db.execute("SELECT AVG(in_corridor) FROM sensor_readings WHERE recorded_at BETWEEN ? AND ?",
+                         (lo, hi)).fetchone()[0]
+    n = last["in_corridor"]
+    trend = None
+    if ref is not None:
+        trend = "up" if n - ref >= 2 else "down" if n - ref <= -2 else "flat"
+    return {"state": "online", "now": n, "level": corridor_level(n), "age": age, "trend": trend}
+
+
+def corridor_line():
+    s = corridor_status()
+    return t("corridor", n=s["now"], lvl=t("lvl_" + s["level"])) if s["now"] is not None else ""
+
+
+def corridor_text(tg):                                                  # READ: student screen
+    """Returns (text, student_has_waiting_ticket, rule_A_is_on)."""
+    s = corridor_status()
+    with conn() as db:
+        st = get_student(db, tg)
+        waiting = sub = False
+        if st is not None:
+            waiting = db.execute("SELECT 1 FROM tickets WHERE student_id = ? AND status = 'waiting'",
+                                 (st["student_id"],)).fetchone() is not None
+            sub = db.execute("SELECT 1 FROM corridor_subs WHERE student_id = ?", (st["student_id"],)).fetchone() is not None
+    lines = [t("cor_title"), ""]
+    if s["now"] is None:
+        lines.append(t("cor_none"))
+    else:
+        lines.append(t("corridor", n=s["now"], lvl=t("lvl_" + s["level"])))
+        if s["trend"]:
+            lines.append(t("trend_" + s["trend"]))
+        lines += ["", t("tip_" + s["level"])]
+    if sub:
+        lines += ["", t("sub_state_on", low=CORRIDOR_LOW)]
+    return "\n".join(lines), waiting, sub
+
+
+def corridor_sub_set(tg, on):                                           # WRITE: rule A
+    """Returns (code, n). Codes: on / off / need_ticket / already_free."""
+    n = corridor_now()
+    with conn() as db:
+        st = get_student(db, tg)
+        if not on:
+            if st is not None:
+                db.execute("DELETE FROM corridor_subs WHERE student_id = ?", (st["student_id"],))
+            return "off", n
+        if st is None or db.execute("SELECT 1 FROM tickets WHERE student_id = ? AND status = 'waiting'",
+                                    (st["student_id"],)).fetchone() is None:
+            return "need_ticket", n
+        if n is not None and n <= CORRIDOR_LOW:
+            return "already_free", n                  # nothing to wait for
+        db.execute("INSERT OR REPLACE INTO corridor_subs(student_id, created_at) VALUES (?, ?)", (st["student_id"], now()))
+        return "on", n
+
+
+def pending_corridor_free():                                            # READ (+ clean-up): rule A
+    """Subscribed students with a waiting ticket, when the corridor is free right now."""
+    n = corridor_now()
+    with conn() as db:
+        db.execute("""DELETE FROM corridor_subs WHERE student_id NOT IN
+                      (SELECT student_id FROM tickets WHERE status = 'waiting' AND student_id IS NOT NULL)""")
+        if n is None or n > CORRIDOR_LOW:
+            return []
+        rows = db.execute("""SELECT cs.student_id, st.telegram_id, t.number, s.prefix,
+                                    (SELECT COUNT(*) FROM tickets x WHERE x.service_id = t.service_id
+                                       AND x.queue_date = t.queue_date AND x.status = 'waiting'
+                                       AND x.number < t.number) AS ahead
+                             FROM corridor_subs cs
+                             JOIN students st ON st.student_id = cs.student_id
+                             JOIN tickets t ON t.student_id = cs.student_id AND t.status = 'waiting'
+                             JOIN services s ON s.service_id = t.service_id""").fetchall()
+    return [dict(r, n=n) for r in rows]
+
+
+def corridor_report():                                                  # READ: administrator screen
+    start = date.today().isoformat() + " 00:00:00"
+    s = corridor_status()
+    with conn() as db:
+        k, avg = db.execute("SELECT COUNT(*), AVG(in_corridor) FROM sensor_readings WHERE recorded_at >= ?", (start,)).fetchone()
+        peak = db.execute("""SELECT in_corridor, recorded_at FROM sensor_readings WHERE recorded_at >= ?
+                             ORDER BY in_corridor DESC, recorded_at ASC LIMIT 1""", (start,)).fetchone()
+        hours = db.execute("""SELECT strftime('%H', recorded_at) AS h, ROUND(AVG(in_corridor), 1) AS v FROM sensor_readings
+                              WHERE recorded_at >= ? GROUP BY h ORDER BY h""", (start,)).fetchall()
+        recent = db.execute("""SELECT recorded_at, people_in, people_out, in_corridor FROM sensor_readings
+                               ORDER BY recorded_at DESC, reading_id DESC LIMIT 5""").fetchall()
+        subs = db.execute("SELECT COUNT(*) FROM corridor_subs").fetchone()[0]
+    return {"status": s, "k": k, "avg": avg, "peak": peak, "hours": hours, "recent": recent, "subs": subs}
+
+
+def smart_text():
+    r = corridor_report()
+    s = r["status"]
+    lines = [t("smart_title"), ""]
+    if s["state"] == "online":
+        lines.append(t("sm_online", sec=int(s["age"])))
+        lines.append(t("sm_now", n=s["now"], lvl=t("lvl_" + s["level"])))
+        if s["trend"]:
+            lines.append(t("trend_" + s["trend"]))
+    elif s["state"] == "offline":
+        lines.append(t("sm_offline", min=max(1, int((s["age"] or 0) // 60))))
+    else:
+        lines.append(t("sm_none"))
+    lines.append("")
+    if r["k"]:
+        lines.append(t("sm_today", peak=r["peak"]["in_corridor"], at=r["peak"]["recorded_at"][11:16], avg=round(r["avg"], 1), k=r["k"]))
+        top = max(h["v"] for h in r["hours"]) or 1
+        lines += ["", t("sm_hours")]
+        lines += [f"  {h['h']}:00 {'█' * max(1, round(10 * h['v'] / top))} {h['v']}" for h in r["hours"]]
+    else:
+        lines.append(t("sm_no_today"))
+    if r["recent"]:
+        lines += ["", t("sm_recent")]
+        lines += [t("sm_recent_row", time=x["recorded_at"][5:19], i=x["people_in"], o=x["people_out"], n=x["in_corridor"])
+                  for x in r["recent"]]
+    lines += ["", t("sm_subs", n=r["subs"]), t("sm_limits", low=CORRIDOR_LOW, hi=CORRIDOR_HIGH)]
+    return "\n".join(lines)
+
+
+def purge_old_readings():                                               # WRITE: privacy - keep data only as long as needed
+    cutoff = (datetime.now() - timedelta(days=SENSOR_KEEP_DAYS)).strftime(TS_FMT)
+    with conn() as db:
+        return db.execute("DELETE FROM sensor_readings WHERE recorded_at < ?", (cutoff,)).rowcount
+
+
+def ingest_reading(sensor_id, people_in, people_out):                   # WRITE: processing layer
+    """The sensor sends only 'how many entered / left'. Here we calculate how many people are inside."""
+    stamp = now()                                                       # the server clock is used, not the device clock
+    with conn() as db:
+        prev = db.execute("""SELECT in_corridor, recorded_at FROM sensor_readings WHERE sensor_id = ?
+                             ORDER BY recorded_at DESC, reading_id DESC LIMIT 1""", (sensor_id,)).fetchone()
+        inside = prev["in_corridor"] if prev and prev["recorded_at"][:10] == stamp[:10] else 0   # a new day starts empty
+        inside = max(0, min(MAX_INSIDE, inside + people_in - people_out))
+        db.execute("""INSERT INTO sensor_readings(sensor_id, recorded_at, people_in, people_out, in_corridor)
+                      VALUES (?, ?, ?, ?, ?)""", (sensor_id, stamp, people_in, people_out, inside))
+    return inside
+
+
+def _valid_count(v):
+    return isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= MAX_STEP
+
+
+class SensorGateway(BaseHTTPRequestHandler):
+    """Network layer: the sensor sends   POST /api/v1/readings   {"sensor_id": "...", "people_in": 2, "people_out": 1}
+    with the header  X-Api-Key.  Listens on 127.0.0.1 only. Answers 201 / 400 / 401 / 404 / 413."""
+    server_version = "CorridorGateway/1.0"
+
+    def log_message(self, fmt, *args):                                  # keep the console quiet
+        log.debug("gateway: " + fmt, *args)
+
+    def _send(self, code, obj):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self._send(200, {"status": "ok"}) if self.path == "/health" else self._send(404, {"error": "not found"})
+
+    def do_POST(self):
+        if self.path != "/api/v1/readings":
+            return self._send(404, {"error": "not found"})
+        key = self.headers.get("X-Api-Key", "")
+        if not hmac.compare_digest(key.encode("utf-8", "replace"), SENSOR_API_KEY.encode("utf-8")):
+            log.warning("gateway: wrong API key from %s", self.client_address[0])
+            return self._send(401, {"error": "bad api key"})
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > 1024:
+            return self._send(413, {"error": "body must be 1..1024 bytes"})
+        try:
+            data = json.loads(self.rfile.read(length))
+        except (ValueError, UnicodeDecodeError):
+            return self._send(400, {"error": "invalid json"})
+        if not (isinstance(data, dict) and isinstance(data.get("sensor_id"), str)
+                and SENSOR_ID_RE.match(data["sensor_id"])
+                and _valid_count(data.get("people_in")) and _valid_count(data.get("people_out"))):
+            return self._send(400, {"error": "sensor_id (letters, digits, - _), people_in and people_out (0..%d) are required" % MAX_STEP})
+        try:
+            inside = ingest_reading(data["sensor_id"], data["people_in"], data["people_out"])
+        except sqlite3.Error:
+            log.exception("gateway: database error")
+            return self._send(500, {"error": "database error"})
+        self._send(201, {"ok": True, "in_corridor": inside})
+
+
+def start_gateway():
+    if not SENSOR_GATEWAY_PORT:
+        return
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", SENSOR_GATEWAY_PORT), SensorGateway)
+    except OSError as e:
+        log.warning("Sensor gateway not started (port %s): %s. The sensor simulator can still write to the database directly.",
+                    SENSOR_GATEWAY_PORT, e)
+        return
+    GATEWAY["server"] = srv
+    threading.Thread(target=srv.serve_forever, daemon=True, name="sensor-gateway").start()
+    log.info("Sensor gateway listens on http://127.0.0.1:%s  (POST /api/v1/readings)", SENSOR_GATEWAY_PORT)
+
+
+def staff_chat_ids(admins_only=False):
+    with conn() as db:
+        sql = "SELECT telegram_id FROM staff WHERE is_active = 1" + (" AND role = 'administrator'" if admins_only else "")
+        return [r["telegram_id"] for r in db.execute(sql)]
 
 
 HITS = {}      # telegram_id -> times of the latest taps (anti-flood, threat #7)
@@ -629,8 +955,8 @@ def stats_text():                                                       # READ (
     ww = "\n".join(f"  [{r['prefix']}] {sname(r['prefix'], r['name'])} — {r['m']}" for r in waits) or "  —"
     ll = f"{lost['lost']} / {lost['total']} ({round(100 * lost['lost'] / lost['total'], 1)}%)" if lost["total"] else "—"
     text = t("stats", days=d, waiting=w) + t("stats_extra", hours=hh, wait=ww, lost=ll)
-    n = corridor_now()
-    return text + ("\n\n" + t("corridor", n=n) if n is not None else "")
+    cl = corridor_line()
+    return text + ("\n\n" + cl if cl else "")
 
 
 # ---------------------------------------------------------------------
@@ -687,7 +1013,8 @@ async def show(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text, img=None, m
 def main_kb():
     return kb([(t("b_take"), "svc"), (t("b_my"), "my")],
               [(t("b_cancel"), "cancel"), (t("b_hist"), "hist")],
-              [(t("b_help"), "help"), (t("b_staff"), "staff")])
+              [(t("b_corridor"), "cor"), (t("b_help"), "help")],
+              [(t("b_staff"), "staff")])
 
 
 async def screen_menu(update, ctx, text=None, img="team"):
@@ -698,7 +1025,10 @@ async def screen_services(update, ctx, head=""):
     rows = services_list()
     buttons = [[(f"[{r['prefix']}] {sname(r['prefix'], r['name'])} — {r['waiting']}", f"take:{r['prefix']}")] for r in rows]
     left = tickets_left(update.effective_user.id)
-    extra = t("left", left=left, n=DAILY_LIMIT) + "\n\n" if left is not None else ""
+    extra = (t("left", left=left, n=DAILY_LIMIT) + "\n") if left is not None else ""
+    cl = corridor_line()
+    extra += (cl + "\n") if cl else ""
+    extra += "\n" if extra else ""
     await show(update, ctx, (head + "\n\n" if head else "") + extra + t("choose"), "queue",
                kb(*buttons, [(t("b_menu"), "menu")]))
 
@@ -726,9 +1056,21 @@ async def screen_my(update, ctx, head=""):
         rows[0].append((t("b_cancel"), "cancel"))
         if tk["can_later"] and tk["ahead"] >= 0:
             rows.append([(t("b_later"), "later")])
+    rows.append([(t("b_corridor"), "cor")])
     rows.append([(t("b_menu"), "menu")])
-    await show(update, ctx, (head + "\n\n" if head else "") + ticket_text(tk),
+    cl = corridor_line() if tk["status"] == "waiting" else ""
+    await show(update, ctx, (head + "\n\n" if head else "") + ticket_text(tk) + ("\n\n" + cl if cl else ""),
                "notify" if tk["status"] == "called" else "queue", kb(*rows))
+
+
+async def screen_corridor(update, ctx, head=""):
+    text, waiting, sub = corridor_text(update.effective_user.id)
+    rows = []
+    if waiting:
+        rows.append([(t("b_sub_off"), "corsub:off")] if sub else [(t("b_sub_on"), "corsub:on")])
+    rows.append([(t("b_refresh"), "cor"), (t("b_sensor"), "corinfo")])
+    rows.append([(t("b_menu"), "menu")])
+    await show(update, ctx, (head + "\n\n" if head else "") + text, "queue", kb(*rows))
 
 
 async def screen_hist(update, ctx):
@@ -775,11 +1117,10 @@ async def staff_guard(update, ctx):
 async def screen_staff_menu(update, ctx, staff, head=""):
     rows = [[(f"[{s['prefix']}] {sname(s['prefix'], s['name'])}", f"sq:{s['prefix']}")] for s in staff_services(staff)]
     if staff["role"] == "administrator":
-        rows.append([(t("b_stats"), "stats")])
+        rows.append([(t("b_stats"), "stats"), (t("b_smart"), "smart")])
     rows.append([(t("b_logout"), "logout"), (t("b_menu"), "menu")])
     body = t("staff_menu", name=esc(staff["full_name"]), role=TEXTS[LANG]["role"][staff["role"]])
-    n = corridor_now()
-    head = "\n".join(x for x in (head, t("corridor", n=n) if n is not None else "") if x)
+    head = "\n".join(x for x in (head, corridor_line()) if x)
     await show(update, ctx, (head + "\n\n" if head else "") + body, "queue", kb(*rows))
 
 
@@ -821,6 +1162,11 @@ async def cmd_help(update, ctx):
                kb([(t("b_delete"), "del")], [(t("b_menu"), "menu")]))
 
 
+async def cmd_corridor(update, ctx):
+    ctx.user_data.pop("state", None)
+    await screen_corridor(update, ctx)
+
+
 async def cmd_myid(update, ctx):
     await update.message.reply_text(t("myid", id=update.effective_user.id), parse_mode=HTML)
 
@@ -841,6 +1187,14 @@ async def on_button(update, ctx):
         await screen_menu(update, ctx)
     elif cmd == "help":
         await cmd_help(update, ctx)
+    elif cmd == "cor":
+        await screen_corridor(update, ctx)
+    elif cmd == "corsub":
+        code, n = corridor_sub_set(tg, len(parts) > 1 and parts[1] == "on")
+        await screen_corridor(update, ctx, t("sub_" + code, low=CORRIDOR_LOW, n=n))
+    elif cmd == "corinfo":
+        await show(update, ctx, t("sensor_info", days=SENSOR_KEEP_DAYS), "study",
+                   kb([(t("b_back"), "cor")], [(t("b_menu"), "menu")]))
     elif cmd == "svc":
         with conn() as db:
             known = get_student(db, tg) is not None
@@ -905,7 +1259,7 @@ async def on_button(update, ctx):
         else:
             ctx.user_data["state"] = "pin"
             await show(update, ctx, t("ask_pin"), "queue", kb([(t("b_menu"), "menu")]))
-    elif cmd in ("smenu", "sq", "sa", "stats", "logout"):
+    elif cmd in ("smenu", "sq", "sa", "stats", "smart", "logout"):
         if cmd == "logout":
             ctx.user_data.pop("staff_until", None)
             await screen_menu(update, ctx, t("logged_out"))
@@ -925,7 +1279,14 @@ async def on_button(update, ctx):
                 deny(staff["staff_id"])
                 await show(update, ctx, t("admin_only"), "queue", kb([(t("b_back"), "smenu")]))
             else:
-                await show(update, ctx, stats_text(), "queue", kb([(t("b_refresh"), "stats"), (t("b_back"), "smenu")]))
+                await show(update, ctx, stats_text(), "queue",
+                           kb([(t("b_refresh"), "stats"), (t("b_smart"), "smart")], [(t("b_back"), "smenu")]))
+        elif cmd == "smart":
+            if staff["role"] != "administrator":
+                deny(staff["staff_id"])
+                await show(update, ctx, t("admin_only"), "queue", kb([(t("b_back"), "smenu")]))
+            else:
+                await show(update, ctx, smart_text(), None, kb([(t("b_refresh"), "smart"), (t("b_back"), "stats")]))
 
 
 async def on_text(update, ctx):
@@ -1086,6 +1447,39 @@ async def push(bot, chat_id, text, animate=False):
         return False
 
 
+async def corridor_watch(bot):
+    """Rule B: the corridor is crowded for several readings in a row -> alert to the staff (with a cool-down).
+    Rule C: the sensor that was online went silent -> alert to the administrators (and again when it is back)."""
+    s = corridor_status()
+    cutoff = (datetime.now() - timedelta(seconds=CORRIDOR_FRESH_SEC)).strftime(TS_FMT)
+    with conn() as db:
+        maxid = db.execute("SELECT COALESCE(MAX(reading_id), 0) FROM sensor_readings").fetchone()[0]
+        if CORR["last_id"] is None:
+            CORR["last_id"] = maxid                                    # old history never triggers an alert
+        rows = db.execute("""SELECT in_corridor FROM sensor_readings WHERE reading_id > ? AND recorded_at >= ?
+                             ORDER BY reading_id LIMIT 500""", (CORR["last_id"], cutoff)).fetchall()
+    CORR["last_id"] = maxid
+    for r in rows:
+        CORR["high_run"] = CORR["high_run"] + 1 if r["in_corridor"] >= CORRIDOR_HIGH else 0
+    if s["state"] == "online":
+        CORR["was_online"] = True
+        if CORR["lost_sent"]:
+            CORR["lost_sent"] = False
+            for chat in staff_chat_ids(admins_only=True):
+                await tell(bot, chat, t("sensor_back"))
+        if (CORR["high_run"] >= CORRIDOR_ALERT_READINGS
+                and time.time() - CORR["last_alert"] >= CORRIDOR_ALERT_COOLDOWN_MIN * 60):
+            CORR["last_alert"] = time.time()
+            log.info("crowd alert: %s people in the corridor", s["now"])
+            for chat in staff_chat_ids():
+                await tell(bot, chat, t("cor_alert", n=s["now"], hi=CORRIDOR_HIGH))
+    elif CORR["was_online"] and not CORR["lost_sent"]:
+        CORR["lost_sent"] = True
+        mins = max(1, int((s["age"] or CORRIDOR_FRESH_SEC) // 60))
+        for chat in staff_chat_ids(admins_only=True):
+            await tell(bot, chat, t("sensor_lost", min=mins))
+
+
 async def notifier(bot):
     while True:
         try:
@@ -1099,6 +1493,12 @@ async def notifier(bot):
                 if await push(bot, r["telegram_id"], text):
                     with conn() as db:
                         db.execute("UPDATE tickets SET near_notified = 1 WHERE ticket_id = ?", (r["ticket_id"],))
+            for r in pending_corridor_free():                          # rule A: the corridor became free
+                text = t("cor_free_push", n=r["n"], code=f"{r['prefix']}-{r['number']}", ahead=r["ahead"])
+                if await push(bot, r["telegram_id"], text):
+                    with conn() as db:
+                        db.execute("DELETE FROM corridor_subs WHERE student_id = ?", (r["student_id"],))
+            await corridor_watch(bot)                                  # rules B and C: staff alerts
             for r in pending_timeouts():
                 if await tell(bot, r["staff_tg"], t("timeout_hint", code=f"{r['prefix']}-{r['number']}", min=CALL_TIMEOUT_MIN)):
                     with conn() as db:
@@ -1106,12 +1506,16 @@ async def notifier(bot):
             if CLEAN["day"] != date.today().isoformat():       # a new day started while the bot was running
                 CLEAN["day"] = date.today().isoformat()
                 log.info("clean-up of old tickets: %s closed", close_stale())
+                log.info("old sensor readings removed: %s", purge_old_readings())
         except Exception:
             log.exception("notifier error")
         await asyncio.sleep(NOTIFY_EVERY)
 
 
 async def post_shutdown(app):
+    srv = GATEWAY.get("server")
+    if srv:
+        srv.shutdown()
     task = app.bot_data.get("notifier")
     if task:
         task.cancel()
@@ -1129,8 +1533,9 @@ def main():
                          f"или создайте её: python make_test_data.py")
     ensure_schema()
     ensure_limit_trigger()
-    CLEAN["day"] = date.today().isoformat()
-    log.info("clean-up of old tickets: %s closed", close_stale())
+    log.info("old sensor readings removed: %s", purge_old_readings())
+    start_gateway()
+    CLEAN["day"] = date.today().isoformat()   # no clean-up at start: the queue is kept after a restart
     for key, name in IMAGES.items():
         if not (IMG_DIR / name).exists():
             log.warning("Picture %s not found - messages will be sent without it", IMG_DIR / name)
@@ -1139,6 +1544,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("corridor", cmd_corridor))
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_text))

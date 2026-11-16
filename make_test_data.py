@@ -1,15 +1,12 @@
 """Creates queue.sqlite from schema.sql and fills it with test data (all names are invented)."""
 import os, random, sqlite3, hashlib, secrets
-from pathlib import Path
 from datetime import date, datetime, timedelta
 
-BASE = Path(__file__).resolve().parent
-DB = os.environ.get("DB_PATH", str(BASE / "queue.sqlite"))
-PIN_ROUNDS = 600_000  # matches the final bot; legacy hashes keep their own pin_rounds
+DB = os.environ.get("DB_PATH", "queue.sqlite")
 random.seed(2619)
 
 def hash_pin(pin, salt_hex):
-    return hashlib.pbkdf2_hmac("sha256", pin.encode(), bytes.fromhex(salt_hex), PIN_ROUNDS).hex()
+    return hashlib.pbkdf2_hmac("sha256", pin.encode(), bytes.fromhex(salt_hex), 200_000).hex()
 
 first_f = ["Aigerim","Dana","Madina","Aruzhan","Aliya","Zhansaya","Assel","Dinara","Kamila","Nazerke","Saltanat","Aizhan","Symbat","Gulnaz","Alina","Karina","Milana","Yelena","Anna","Sofiya"]
 first_m = ["Aldiyar","Nurtore","Dias","Alikhan","Yerlan","Bauyrzhan","Arman","Temirlan","Ruslan","Nursultan","Daniyar","Miras","Islam","Timur","Maksim","Artem","Kanat","Rakhat","Adilet","Sanzhar"]
@@ -25,7 +22,7 @@ fixed_pins = {1:"482915", 2:"736204"}
 
 if os.path.exists(DB): os.remove(DB)
 db = sqlite3.connect(DB)
-db.executescript((BASE / "schema.sql").read_text(encoding="utf-8"))
+db.executescript(open("schema.sql").read())
 db.executemany("INSERT INTO services(name,prefix,avg_minutes) VALUES (?,?,?)", services)
 
 # students
@@ -45,8 +42,8 @@ for i,(n,tg) in enumerate(zip(sorted(names, key=lambda x: random.random()), tg_i
 for sid,(n,role) in enumerate(staff, start=1):
     pin = fixed_pins.get(sid, f"{secrets.randbelow(900000)+100000}")
     salt = secrets.token_hex(16)
-    db.execute("INSERT INTO staff(telegram_id,full_name,role,pin_salt,pin_hash,pin_rounds) VALUES (?,?,?,?,?,?)",
-               (100_000_000+sid*7919, n, role, salt, hash_pin(pin, salt), PIN_ROUNDS))
+    db.execute("INSERT INTO staff(telegram_id,full_name,role,pin_salt,pin_hash) VALUES (?,?,?,?,?)",
+               (100_000_000+sid*7919, n, role, salt, hash_pin(pin, salt)))
 for sid, srvs in staff_srv.items():
     for s in srvs: db.execute("INSERT INTO staff_services VALUES (?,?)", (sid, s))
 

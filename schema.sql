@@ -22,7 +22,6 @@ CREATE TABLE staff (
     role        TEXT    NOT NULL CHECK (role IN ('operator', 'administrator')),
     pin_salt    TEXT    NOT NULL,
     pin_hash    TEXT    NOT NULL,
-    pin_rounds  INTEGER NOT NULL DEFAULT 200000 CHECK (pin_rounds > 0),
     is_active   INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1))
 );
 
@@ -45,9 +44,6 @@ CREATE TABLE tickets (
     called_at   TEXT,
     finished_at TEXT,
     notified    INTEGER NOT NULL DEFAULT 0 CHECK (notified IN (0, 1)),
-    near_notified INTEGER NOT NULL DEFAULT 0,
-    swaps       INTEGER NOT NULL DEFAULT 0,
-    timeout_hinted INTEGER NOT NULL DEFAULT 0,
     UNIQUE (service_id, queue_date, number),
     CHECK (status <> 'done' OR finished_at IS NOT NULL),
     CHECK (called_at IS NULL OR called_at >= created_at)
@@ -65,21 +61,20 @@ CREATE TABLE audit_log (
     created_at TEXT NOT NULL
 );
 
--- Additional tables used by the final bot.py (new installations).
--- For an old Assignment 3 database, bot.py automatically adds them at startup.
-CREATE TABLE pin_lock (
-    telegram_id INTEGER PRIMARY KEY,
-    n INTEGER NOT NULL DEFAULT 0,
-    locked_until REAL NOT NULL DEFAULT 0
-);
-
+-- Smart corridor (Project Stage 2, Part D). Only counts and time: no personal data.
 CREATE TABLE sensor_readings (
-    reading_id INTEGER PRIMARY KEY,
-    sensor_id TEXT NOT NULL,
-    recorded_at TEXT NOT NULL,
-    people_in INTEGER NOT NULL CHECK (people_in >= 0),
-    people_out INTEGER NOT NULL CHECK (people_out >= 0),
+    reading_id  INTEGER PRIMARY KEY,
+    sensor_id   TEXT    NOT NULL,
+    recorded_at TEXT    NOT NULL,
+    people_in   INTEGER NOT NULL CHECK (people_in  >= 0),
+    people_out  INTEGER NOT NULL CHECK (people_out >= 0),
     in_corridor INTEGER NOT NULL CHECK (in_corridor >= 0)
 );
+CREATE INDEX idx_sensor_time ON sensor_readings(recorded_at);
 
--- bot.py creates its daily_ticket_limit trigger at startup according to its settings.
+-- Rule "tell me when the corridor is free": one row per subscribed student, deleted together with the student.
+CREATE TABLE corridor_subs (
+    student_id INTEGER PRIMARY KEY REFERENCES students(student_id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL
+);
+

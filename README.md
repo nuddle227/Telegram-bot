@@ -1,119 +1,71 @@
 # Digital Queue for the Dean's Office
 
-A Telegram queue bot for the dean's office (Astana IT University, SE-2619).
-Students register, obtain tickets, see the queue, cancel tickets, and receive notifications.
-Authorized operators call/complete/skip tickets; administrators also see statistics.
-The application uses a **local SQLite database**, not a public database server.
+Telegram bot for the queue of the dean's office (Astana IT University, SE-2619).
+A student takes a ticket in the chat, sees the position and gets a message when the turn is near.
+Dean's office staff call, skip and complete tickets in the same bot. Data is stored in SQLite.
 
 Authors: Nurtore Akzhol, Aldiyar Saifula.
 
-> `bot.py` is the teammate's supplied final bot, included **without source changes**.
-> The support scripts and documentation have been updated to work with that version.
-
 ## Requirements
+Python 3.10 or newer, a Telegram account, and a bot token from @BotFather.
 
-- Python 3.10+ and a Telegram account
-- Bot token from [@BotFather](https://t.me/BotFather)
-- Internet access for the Telegram Bot API
-- Python dependencies in `requirements.txt`
+## Run the project
+1. Install the library: `pip install -r requirements.txt`
+2. Create the database with invented test data: `python make_test_data.py`
+   (creates `queue.sqlite` from `schema.sql`; it deletes an existing file with this name).
+3. Give the bot your token, either in the line `BOT_TOKEN` of `bot.py` or as an environment variable:
+   `set BOT_TOKEN=123456:ABC...` (Windows) or `export BOT_TOKEN=123456:ABC...` (Linux, macOS).
+   Never commit a real token.
+4. Add your own Telegram account as a staff member (the test staff in the database have invented Telegram IDs):
+   send `/myid` to the bot, then run `python add_staff.py` and enter the ID, a name, the role and a PIN.
+5. Start the bot: `python bot.py`. Keep the window open. Stop with Ctrl+C.
+6. Optional, simulated IoT sensor ("smart corridor"): in a second terminal run `python sensor_sim.py --demo`.
+   Students see the number of people in the corridor, the administrator gets the screen "Smart corridor" (see below).
+Set `LANG = "en"` in `bot.py` for the English interface (default is Russian).
 
-## Run locally — Windows / VS Code / PowerShell
-
-Open a terminal in the project folder (where `bot.py` is located).
-
-```powershell
-py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-```
-
-**Set up the database once** (WARNING: this deletes an existing `queue.sqlite` and replaces it with **invented test data**):
-
-```powershell
-.\.venv\Scripts\python.exe make_test_data.py
-```
-
-Create a local file called `token.txt` containing only your BotFather token; this file is ignored by Git. Then, in **the same PowerShell terminal**:
-
-```powershell
-$env:BOT_TOKEN = (Get-Content .\token.txt -Raw).Trim()
-.\.venv\Scripts\python.exe bot.py
-```
-
-Keep the terminal open while the bot is running. Stop with `Ctrl+C`.
-On macOS/Linux, use `python3 -m venv .venv`, `.venv/bin/python`, and
-`export BOT_TOKEN="$(cat token.txt)"` instead.
-You can also supply `BOT_TOKEN` by another secure environment-variable mechanism.
-**Never change the bot token inside code or commit a real token, user data, or database.**
-
-The bot will automatically create any missing final-version database columns/tables and its daily-ticket-limit trigger when starting with an *older* Assignment 3 database.
-The included `schema.sql` already describes the final tables for new databases.
-
-## How to test each role
-
-| Role | Test setup | Main capabilities |
+## Test accounts (all data is invented)
+| Role | How to get it | Can do |
 |---|---|---|
-| Student | Start the bot with any test Telegram account, consent and register | Ticket, position, history, cancel, delete profile |
-| Operator | Run `add_staff.py` with the operator's real **test Telegram ID** (via `/myid`), role `operator`, assigned services, and a test PIN | Call, complete, skip in assigned services |
-| Administrator | Run `add_staff.py` with a test Telegram ID, role `administrator`, and a test PIN | All services and statistics |
+| Student | Any Telegram account: press Start, Take a ticket, agree, enter a name and a group | Take, view and cancel one ticket |
+| Operator | `python add_staff.py`, role `operator`, services for example `C R` | Queue, call, skip, complete for assigned services only |
+| Administrator | `python add_staff.py`, role `administrator` | All services and Statistics |
 
-Register staff after generating the database; stop the bot first if you want, then run:
+The supplied database also has invented staff for the command-line prototype
+(administrator ID 100007919, PIN 482915; operator ID 100015838, PIN 736204, Certificate only).
+These IDs do not belong to real Telegram accounts, so use `add_staff.py` to log in through the bot.
 
-```powershell
-.\.venv\Scripts\python.exe add_staff.py
-```
-
-Restart the bot and use **For staff** to log in with the PIN. For an operator, select service prefixes (`C R A O`).
-`add_staff.py` saves a random salt and **600,000-round PBKDF2-HMAC-SHA256** hash with a `pin_rounds` value. The bot also supports existing **200,000-round** test hashes and upgrades them upon successful login.
-
-The synthetic dataset generated by `make_test_data.py` also contains invented staff IDs and PINs for the **command-line prototype**, but those invented Telegram IDs will not receive real Telegram messages. To test the Telegram interface, register your own test accounts via `add_staff.py`.
-
-## Simulated IoT corridor counter
-
-In a **second** terminal, from the project folder:
-
-```powershell
-.\.venv\Scripts\python.exe sensor_sim.py
-```
-
-The simulation writes a new reading every 3 seconds to `sensor_readings` (`sensor_id`, `recorded_at`, `people_in`, `people_out`, `in_corridor`). The bot's staff menu and administrator statistics read the latest value if it is no older than 120 seconds. For a quick database test, run `sensor_sim.py --once`.
-
-## Offline checks
-
-After installing the dependencies, run database/compatibility smoke tests **without starting Telegram**:
-
-```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
-```
-
-These use temporary **synthetic** SQLite databases; live Telegram callbacks/notifications still require manual tests with the real bot.
-
-## Other scripts
-
-| File/directory | Description |
+## Files
+| File | Purpose |
 |---|---|
-| `bot.py` | Telegram bot, exactly as provided by teammate |
-| `schema.sql` | Final SQLite schema; includes tables for staff lockouts and simulated sensor readings |
-| `make_test_data.py` | **Destructive** creation of the synthetic test database |
-| `add_staff.py` | Register/update a real test Telegram staff account and its per-hash PIN rounds |
-| `sensor_sim.py` | Simulated corridor sensor, compatible with `bot.py` |
-| `prototype.py` | Assignment 3 command-line prototype (reads both old and new PIN hashes) |
-| `backup.py` | Local database backup utility (writes to the ignored `backup/` folder) |
-| `tests/` | Offline database compatibility smoke tests |
-| `images/`, `assets/`, `web/`, `a2_experiment/` | Telegram media, static demo, multimedia experiments |
+| `bot.py` | the Telegram bot (student and staff screens, notifications, statistics) |
+| `schema.sql`, `make_test_data.py` | database structure and test data generator |
+| `add_staff.py` | adds or updates a staff member (PIN is stored as a salted PBKDF2 hash) |
+| `sensor_queries.py` | ready-made read-only SQL queries for the sensor data (hourly average, peak, crowded share, ...) |
+| `sensor_sim.py` | simulated corridor people counter (sends readings to the gateway in `bot.py`; table `sensor_readings`) |
+| `backup.py` | daily backup of the database file |
+| `prototype.py` | command-line prototype from Assignment 3 (same database and rules) |
+| `images/`, `assets/`, `web/` | media: optimised JPEG pictures, bell animation, SVG logo, static page for the page-weight test |
 
-For example, once the database exists, you can run a command-line prototype query:
+## Security notes
+PIN hash with salt (PBKDF2-HMAC-SHA256, 200,000 rounds), parameterised SQL, approved staff list with roles,
+lockout after 5 wrong PINs, 30-minute staff session, audit log of staff actions.
+The database file has no network port. The prototype contains only invented data.
 
-```powershell
-.\.venv\Scripts\python.exe prototype.py services
-```
+## Smart corridor (IoT extension, Project Stage 2, Part D)
+A people counter at the corridor door reports how many people entered and left. The bot turns this into three smart rules.
+No camera, names or Telegram IDs are stored with a reading.
 
-## Security and sharing
+| Layer | What it is in this project |
+|---|---|
+| 1. Device | `sensor_sim.py` (simulates an ESP32 with two door-frame sensors) |
+| 2. Network | HTTP POST `/api/v1/readings` with the header `X-Api-Key`, to `127.0.0.1:8765` (a real device would use Wi-Fi + HTTPS or MQTT over TLS) |
+| 3. Processing | the gateway inside `bot.py`: validates the data, calculates "people inside", writes to `sensor_readings`, runs the rules |
+| 4. Application | the Telegram bot: "Corridor" screen, notifications, administrator screen "Smart corridor" |
 
-- `.gitignore` excludes `queue.sqlite`, `backup/`, `token.txt`, `.env`, `.venv/`, and generated Python files. **Verify with `git status` before every commit.**
-- Never upload real student or staff data, PINs, `.env` files, BotFather tokens, or database backups.
-- Staff authentication uses a salted PBKDF2 hash with a recorded iteration count; access is restricted by roles and services. The bot also provides rate limiting, lockout after five wrong PINs, sessions and an audit log.
-- SQL queries use parameter placeholders where user-supplied values are involved.
-- If you have an existing local database, back it up before running `make_test_data.py`.
-- The bot must be running for live Telegram responses; this project does not include public hosting.
+Rules: **A** the student with a waiting ticket can press "Tell me when it is free" and gets a message when the corridor has at most `CORRIDOR_LOW` (5) people;
+**B** the staff get an alert when `CORRIDOR_HIGH` (12) or more people stay in the corridor for 3 readings in a row (at most one alert per 10 minutes);
+**C** the administrators get an alert when a sensor that was online stops sending data (and a message when it is back).
+Privacy: readings older than `SENSOR_KEEP_DAYS` (30) are deleted automatically; a subscription is deleted together with the student profile.
+Settings are at the top of `bot.py`. Change the sensor key with the environment variable `SENSOR_API_KEY` (the same value for the bot and `sensor_sim.py`).
+All data made by `sensor_sim.py` is simulated test data (sensor id `SIM-01`).
 
-See [README_RU.md](README_RU.md) for detailed Russian instructions.
