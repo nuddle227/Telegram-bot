@@ -12,3 +12,5 @@ venv/
 *.sqlite-shm
 *.db
 .DS_Store
+copy.sqlite
+copy_with_staff.sqlite
